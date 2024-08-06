@@ -1,0 +1,362 @@
+#!/usr/bin/python3
+import click
+import os
+import json
+import subprocess
+import getpass
+import secrets
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+import base64
+
+@click.group()
+def bw():
+    """
+    Provides capabilities to unlock Bitwarden Vault CLI using Yubikeys
+
+    Bitwarden provides a command line interface (CLI) for interacting
+    with a vault. This CLI interface is a great enabler for automation
+    flows with secrets and passwords that are protected in an end to
+    end encrypted manner. The Bitwarden CLI allows for logging into
+    a vault within a device and then placing that vault into a locked
+    state.
+
+    Once locked, the only method to access the vault contents is through
+    providing the vaults master key. This enables the bitwarden cli to
+    generate the vaults master key. This utility allows for wrapping that
+    master password using the challenge-response capability of newer yubikeys.
+    The challenge-response works by storing a 20-byte (160-bit) secret into
+    the key that can't be extracted. While unextractable, the stored secret
+    can be utilized in hmac-sha1 to derive keys from that master secret. This
+    serves as the basis for how the utility protects the vault master
+    password and enabling unlocking when appropriate yubikey has been
+    inserted.
+    """
+    pass
+
+def master_password_prompt():
+    try:
+        # Prompt the user for a password
+        password = getpass.getpass("Enter vault master password: ")
+        return password
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+def get_yubikey_serial():
+    try:
+        # Run the ykinfo -s command and capture the output
+        result = subprocess.run(['ykinfo', '-s'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        # Check if the command was successful
+        if result.returncode == 0:
+            # Extract the serial number from the output
+            output = result.stdout
+            if 'serial:' in output:
+                # Split the output by the colon and strip any surrounding whitespace
+                serial = output.split('serial:')[1].strip()
+                return serial
+            else:
+                print("Serial number not found in the output.")
+        else:
+            print(f"Command failed with error: {result.stderr}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    return None
+
+def open_config():
+
+    username = os.getlogin()
+    cfg_dir = "/home/%s/.config/scc" % (username)
+    cfg_path = os.path.join(cfg_dir, 'bundles.json')
+    if not os.path.exists(cfg_dir):
+        os.makedirs(cfg_dir)
+
+    cfg = {}
+    if os.path.exists(cfg_path):
+        with open(cfg_path, 'rt') as f:
+            cfg = json.loads(f.read())
+
+    return cfg
+
+def save_config(cfg):
+
+    username = os.getlogin()
+    cfg_dir = "/home/%s/.config/scc" % (username)
+    cfg_path = os.path.join(cfg_dir, 'bundles.json')
+    with open(cfg_path, 'wt') as f:
+        f.write(json.dumps(cfg, indent=3))
+
+def send_challenge_to_yubikey(challenge):
+    """
+    Sends challenge to slot 2 of the yubikey
+
+    Sends the challenge to slot 2 of the yubikey to be utilized
+    as input to the hmac-sha1 operation. The response from the
+    yubikey will be 20 bytes in hex format.
+    
+    @param challenge A byte array to utilize as the challenge to the yubikey
+    """
+
+    print("Sending challenge to yubikey. If necessary, please touch yubikey for use of second slot ...")
+
+    try:
+        # Run the ykinfo -s command and capture the output
+        result = subprocess.run(['ykchalresp', '-2', '-x', challenge.hex()], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        # Check if the command was successful
+        if result.returncode == 0:
+            # Extract the serial number from the output
+            output = result.stdout
+            return bytes.fromhex(output)
+
+        else:
+            print(f"Command failed with error: {result.stderr}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    return None
+
+def aes_gcm_encrypt(password, key):
+    # Generate a random 12-byte nonce (recommended size for GCM)
+    nonce = secrets.token_bytes(12)
+
+    # Create a Cipher object with AES algorithm and GCM mode
+    cipher = Cipher(
+        algorithms.AES(key),
+        modes.GCM(nonce),
+        backend=default_backend()
+    )
+    encryptor = cipher.encryptor()
+
+    # Encrypt the password
+    ciphertext = encryptor.update(password.encode()) + encryptor.finalize()
+
+    return nonce, ciphertext, encryptor.tag
+
+def aes_gcm_decrypt(key, ciphertext, nonce, tag):
+
+    # Create a Cipher object with AES algorithm and GCM mode
+    cipher = Cipher(
+        algorithms.AES(key),
+        modes.GCM(nonce, tag),
+        backend=default_backend()
+    )
+    decryptor = cipher.decryptor()
+
+    # Decrypt the ciphertext
+    decrypted_password = decryptor.update(ciphertext) + decryptor.finalize()
+
+    return decrypted_password.decode()
+
+def wrap_password(password):
+    """
+    Encrypts the password with AES-GCM
+
+    Handles process of deriving a key from the yubikey that
+    is then utilized with AES-GCM to wrap the master password.
+
+    @param password Vault master password
+    """
+    # generate salt for wrapping
+    salt = secrets.token_bytes(32)
+
+    # generate bundle key using 20-bytes within yubikey as master derivation key
+    bundle_key = send_challenge_to_yubikey(salt)
+    if bundle_key is None:
+        print("Failed to acquire challenge from yubikey")
+        return None
+    
+    # expand bundle key (20 bytes) to 32 bytes for AES-GCM
+    context = get_yubikey_serial()
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=context.encode('utf-8'))
+    key = hkdf.derive(bundle_key)
+
+    nonce, ciphertext, tag = aes_gcm_encrypt(password, key)
+
+    envelope = {
+        'nonce' : base64.b64encode(nonce).decode('utf-8'),
+        'ciphertext' : base64.b64encode(ciphertext).decode('utf-8'),
+        'tag' : base64.b64encode(tag).decode('utf-8'),
+        'salt' : base64.b64encode(salt).decode('utf-8')
+    }
+    return envelope
+
+def unwrap_password(envelope):
+    """
+    Decrypts the password with AES-GCM
+
+    Handles process of deriving a key from the yubikey that
+    is then utilized with AES-GCM to access the enrolled master
+    password from the bundle.
+
+    @param envelope Wrapped master password and salt for support decryption of password
+    """
+
+    nonce = base64.b64decode(envelope['nonce'])
+    ciphertext = base64.b64decode(envelope['ciphertext'])
+    tag = base64.b64decode(envelope['tag'])
+    salt = base64.b64decode(envelope['salt'])
+
+    # generate bundle key using 20-bytes within yubikey as master derivation key
+    bundle_key = send_challenge_to_yubikey(salt)
+    if bundle_key is None:
+        print("Failed to acquire challenge from yubikey")
+        return None
+    
+    # expand bundle key (20 bytes) to 32 bytes for AES-GCM
+    context = get_yubikey_serial()
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=context.encode('utf-8'))
+    key = hkdf.derive(bundle_key)
+
+    password = aes_gcm_decrypt(key, ciphertext, nonce, tag)
+    return password
+
+def unlock_bitwarden(password):
+    """
+    Triggers bitwarden CLI unlock to obtain BW_SESSION
+
+    Bitwarden CLI utilizes the BW_SESSION environment variable
+    for tracking whether the vault is unlocked. This function
+    handles process of unlocking the vault and capturing that
+    session token.
+
+    @param password Master password for the vault.
+    """
+    try:
+        # Call the bw unlock command with the provided password
+        result = subprocess.run(
+            ['/snap/bin/bw', 'unlock', '--passwordenv', 'BW_PASSWORD', '--raw'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={"BW_PASSWORD": password}
+        )
+
+        # Check if the command was successful
+        if result.returncode == 0:
+            # Capture the session key from the output
+            session_key = result.stdout.strip()
+            return session_key
+        else:
+            print(f"Error unlocking Bitwarden: {result.stderr}")
+            return None
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+@bw.command()
+def enroll():
+    """
+    Enroll a yubikey to unlock the bitwarden cli vault
+
+    Initiates the process of generating a bundle for a given yubikey
+    that enables it to unwrap a vaults master password. The vault master
+    password will be encrypted with AES-GCM from a key that is derived
+    using the hmac-sha1 capabilities of the yubikey. As such, the yubikey
+    should have it's slot 2 configured in hmac-sha1 (e.g. challenge-response)
+    mode with a 20 byte secret.
+    """
+
+    serial = get_yubikey_serial()
+    if serial is None:
+        print("Please ensure that yubikey is plugged into USB.")
+        return 0
+    print("Registering: " + serial)
+    
+    cfg = open_config()
+    if serial in cfg:
+        print(serial + " already enrolled. Please remove before continuing")
+        return 0
+    
+    password = master_password_prompt()
+    if password is None:
+        print("Please retry enrollment and provide password before pressing enter")
+        return 1
+    
+    envelope = wrap_password(password)
+    if envelope is None:
+        print("Envelope generation failed. Please try again.")
+        return 1
+    
+    cfg[serial] = envelope
+    save_config(cfg)
+
+    print("Enrollment Complete for " + serial)
+
+@bw.command()
+@click.option('--serial', default='', help='Serial number to be removed.')
+def remove(serial):
+    """
+    Removes the bundle associated with particular yubikey
+
+    The tool supports a single bundle for a given yubikey based
+    upon the serial number. So, it becomes necessary to remove a previous
+    bundle as a means to remove access to the vault or to re-register the
+    yubikey.
+    
+    @param serial Serial number of the yubikey to remove from the system
+    """
+
+    cfg = open_config()
+    if serial not in cfg:
+        return 0
+    
+    del cfg[serial]
+    save_config(cfg)
+
+    print("Yubikey " + serial + " has been removed")
+
+@bw.command()
+def unlock():
+    """
+    Unlocks the Bitwarden CLI vault with detected Yubikey
+
+    The yubikey serial number will be compared with the bundles that are
+    registered within the device. If a match is found, the bw vault will be
+    unlocked by unwrapping the vault master password using the hmac-sha1
+    challenge-response feature of slot2 from the yubikey.
+    """
+
+    serial = get_yubikey_serial()
+    if serial is None:
+        print("Please ensure that yubikey is plugged into USB.")
+        return 0
+    
+    cfg = open_config()
+    if serial not in cfg:
+        print("No registration detected for " + serial + ". Please check yubikey registration.")
+        return 1
+    
+    envelope = cfg[serial]
+    password = unwrap_password(envelope)
+    token=unlock_bitwarden(password)
+
+    print("Spawning Bash Session ...")
+    env = os.environ.copy()
+    env.update({'BW_SESSION' : token})
+    subprocess.run('/usr/bin/bash', env=env, shell=True, text=True)
+
+@bw.command()
+def list():
+    """
+    List serial numbers of yubikey's that are registered
+    """
+    cfg = open_config()
+    for serial in cfg:
+        print(" -- SN: " + serial)
+
+
+# Nesting the groups
+bw.add_command(enroll)
+bw.add_command(unlock)
+bw.add_command(list)
+bw.add_command(remove)
+
+if __name__ == '__main__':
+    bw()
