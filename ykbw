@@ -309,8 +309,21 @@ def remove(serial):
     @param serial Serial number of the yubikey to remove from the system
     """
 
+    if len(serial) == 0:
+        print("No serial number provided. Detecting connected keys ...")
+        connected_serial = get_yubikey_serial()
+        if connected_serial is None:
+            return 1
+        
+        response = input("Remove " + connected_serial + " enrollment? ").strip().lower()
+        if response == 'y':
+            serial = connected_serial
+        else:
+            return 1
+
     cfg = open_config()
     if serial not in cfg:
+        print("%s was not registered!" % (serial))
         return 0
     
     del cfg[serial]
