@@ -351,6 +351,32 @@ def unlock():
     subprocess.run('/usr/bin/bash', env=env, shell=True, text=True)
 
 @bw.command()
+def show():
+    """
+    Prints enrolled vault password for yubikey
+
+    Handles process of unlocking password using the connected yubikey. The
+    unlocked password will then be printed to the console.
+    """
+
+    serial = get_yubikey_serial()
+    if serial is None:
+        print("Please ensure that yubikey is plugged into USB.")
+        return 0
+    
+    cfg = open_config()
+    if serial not in cfg:
+        print("No registration detected for " + serial + ". Please check yubikey registration.")
+        return 1
+    
+    envelope = cfg[serial]
+    password = unwrap_password(envelope)
+    if password is None:
+        return 1
+    
+    print("Unlocked Password: \"%s\"" % (password))
+
+@bw.command()
 def list():
     """
     List serial numbers of yubikey's that are registered
@@ -360,10 +386,10 @@ def list():
         print(" -- SN: " + serial)
 
 
-# Nesting the groups
 bw.add_command(enroll)
 bw.add_command(unlock)
 bw.add_command(list)
+bw.add_command(show)
 bw.add_command(remove)
 
 if __name__ == '__main__':
