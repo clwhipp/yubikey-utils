@@ -1,0 +1,355 @@
+#!/usr/bin/python3
+import click
+import os
+import json
+import subprocess
+import getpass
+import secrets
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.exceptions import InvalidTag
+import base64
+
+@click.group()
+def sec():
+    """
+    Provides capabilities to manage secrets using yubikeys
+
+    """
+    pass
+
+def prompt_for_secret():
+    try:
+        # Prompt the user for a password
+        password = getpass.getpass("Enter secret: ")
+        return password
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+def get_yubikey_serial():
+    try:
+        # Run the ykinfo -s command and capture the output
+        result = subprocess.run(['ykinfo', '-s'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        # Check if the command was successful
+        if result.returncode == 0:
+            # Extract the serial number from the output
+            output = result.stdout
+            if 'serial:' in output:
+                # Split the output by the colon and strip any surrounding whitespace
+                serial = output.split('serial:')[1].strip()
+                return serial
+            else:
+                print("Serial number not found in the output.")
+        else:
+            print(f"Command failed with error: {result.stderr}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    return None
+
+def open_config():
+
+    cfg_path = os.getenv('YKSEC_PATH')
+    if cfg_path == None:
+
+        username = os.getlogin()
+        cfg_dir = "/home/%s/.config/yksec" % (username)
+        cfg_path = os.path.join(cfg_dir, 'bundles.json')
+        if not os.path.exists(cfg_dir):
+            os.makedirs(cfg_dir)
+
+    cfg = {}
+    if os.path.exists(cfg_path):
+        with open(cfg_path, 'rt') as f:
+            cfg = json.loads(f.read())
+
+    return cfg
+
+def save_config(cfg):
+
+    cfg_path = os.getenv('YKSEC_PATH')
+    if cfg_path == None:
+
+        username = os.getlogin()
+        cfg_dir = "/home/%s/.config/yksec" % (username)
+        cfg_path = os.path.join(cfg_dir, 'bundles.json')
+        if not os.path.exists(cfg_dir):
+            os.makedirs(cfg_dir)
+
+    with open(cfg_path, 'wt') as f:
+        f.write(json.dumps(cfg, indent=3))
+
+def send_challenge_to_yubikey(challenge):
+    """
+    Sends challenge to slot 2 of the yubikey
+
+    Sends the challenge to slot 2 of the yubikey to be utilized
+    as input to the hmac-sha1 operation. The response from the
+    yubikey will be 20 bytes in hex format.
+    
+    @param challenge A byte array to utilize as the challenge to the yubikey
+    """
+
+    try:
+        # Run the ykinfo -s command and capture the output
+        result = subprocess.run(['ykchalresp', '-2', '-x', challenge.hex()], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        # Check if the command was successful
+        if result.returncode == 0:
+            # Extract the serial number from the output
+            output = result.stdout
+            return bytes.fromhex(output)
+
+        else:
+            print(f"Command failed with error: {result.stderr}")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    return None
+
+def aes_gcm_encrypt(password, key):
+    # Generate a random 12-byte nonce (recommended size for GCM)
+    nonce = secrets.token_bytes(12)
+
+    # Create a Cipher object with AES algorithm and GCM mode
+    cipher = Cipher(
+        algorithms.AES(key),
+        modes.GCM(nonce),
+        backend=default_backend()
+    )
+    encryptor = cipher.encryptor()
+
+    # Encrypt the password
+    ciphertext = encryptor.update(password.encode()) + encryptor.finalize()
+
+    return nonce, ciphertext, encryptor.tag
+
+def aes_gcm_decrypt(key, ciphertext, nonce, tag):
+
+    # Create a Cipher object with AES algorithm and GCM mode
+    cipher = Cipher(
+        algorithms.AES(key),
+        modes.GCM(nonce, tag),
+        backend=default_backend()
+    )
+    decryptor = cipher.decryptor()
+
+    # Decrypt the ciphertext
+    decrypted_password = decryptor.update(ciphertext) + decryptor.finalize()
+
+    return decrypted_password.decode()
+
+def wrap_secret(secret, context = ''):
+    """
+    Encrypts the password with AES-GCM
+
+    Handles process of deriving a key from the yubikey that
+    is then utilized with AES-GCM to wrap the secret.
+
+    @param secret Secret to be stored
+    """
+    # generate salt for wrapping
+    salt = secrets.token_bytes(32)
+
+    # generate bundle key using 20-bytes within yubikey as master derivation key
+    bundle_key = send_challenge_to_yubikey(bytes.fromhex('796B62772D') + salt)
+    if bundle_key is None:
+        print("Failed to acquire challenge from yubikey")
+        return None
+    
+    # expand bundle key (20 bytes) to 32 bytes for AES-GCM
+    sn = get_yubikey_serial()
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=context.encode('utf-8') + sn.encode('utf-8'))
+    key = hkdf.derive(bundle_key)
+
+    nonce, ciphertext, tag = aes_gcm_encrypt(secret, key)
+
+    envelope = {
+        'context' : context,
+        'nonce' : base64.b64encode(nonce).decode('utf-8'),
+        'ciphertext' : base64.b64encode(ciphertext).decode('utf-8'),
+        'tag' : base64.b64encode(tag).decode('utf-8'),
+        'salt' : base64.b64encode(salt).decode('utf-8')
+    }
+    return envelope
+
+def unwrap_secret(envelope):
+    """
+    Decrypts the secret with AES-GCM
+
+    Handles process of deriving a key from the yubikey that
+    is then utilized with AES-GCM to access the enrolled secret.
+
+    @param envelope Wrapped secret to be unwrapped
+    """
+
+    context = envelope['context']
+    nonce = base64.b64decode(envelope['nonce'])
+    ciphertext = base64.b64decode(envelope['ciphertext'])
+    tag = base64.b64decode(envelope['tag'])
+    salt = base64.b64decode(envelope['salt'])
+
+    # generate bundle key using 20-bytes within yubikey as master derivation key
+    bundle_key = send_challenge_to_yubikey(bytes.fromhex('796B62772D') + salt)
+    if bundle_key is None:
+        print("Failed to acquire challenge from yubikey")
+        return None
+    
+    # expand bundle key (20 bytes) to 32 bytes for AES-GCM
+    sn = get_yubikey_serial()
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=context.encode('utf-8') + sn.encode('utf-8'))
+    key = hkdf.derive(bundle_key)
+
+    try:
+        secret = aes_gcm_decrypt(key, ciphertext, nonce, tag)
+    except InvalidTag:
+        print("Bundle decryption failed!")
+        return None
+
+    return secret
+
+@sec.command()
+@click.option('--context', default='', help='Context for the secret to be protected.')
+def enroll(context = bytes()):
+    """
+    Enroll a yubikey to protect a secret
+
+    Initiates the process of generating a bundle for a given yubikey
+    that enables it to unwrap a vaults master password. The vault master
+    password will be encrypted with AES-GCM from a key that is derived
+    using the hmac-sha1 capabilities of the yubikey. As such, the yubikey
+    should have it's slot 2 configured in hmac-sha1 (e.g. challenge-response)
+    mode with a 20 byte secret.
+    """
+    serial = get_yubikey_serial()
+    if serial is None:
+        print("Please ensure that yubikey is plugged into USB.")
+        return 0
+    print("Registering: " + serial)
+    
+    cfg = open_config()
+    secret = prompt_for_secret()
+    if secret is None:
+        print("Please retry enrollment and provide password before pressing enter")
+        return 1
+    
+    envelope = wrap_secret(secret, context)
+    if envelope is None:
+        print("Envelope generation failed. Please try again.")
+        return 1
+    
+    if serial not in cfg:
+        cfg[serial] = []
+    cfg[serial].append(envelope)
+    save_config(cfg)
+
+    print("Enrollment Complete for " + serial)
+
+@sec.command()
+@click.option('-s', '--serial', default='', help='Serial number to be removed.')
+def remove(serial):
+    """
+    Removes the bundle associated with particular yubikey
+    
+    @param serial Serial number of the yubikey to remove from the system
+    """
+    if len(serial) == 0:
+        print("No serial number provided. Detecting connected keys ...")
+        connected_serial = get_yubikey_serial()
+        if connected_serial is None:
+            return 1
+        
+        response = input("Remove " + connected_serial + " enrollment? ").strip().lower()
+        if response == 'y':
+            serial = connected_serial
+        else:
+            return 1
+
+    cfg = open_config()
+    if serial not in cfg:
+        print("%s was not registered!" % (serial))
+        return 0
+    
+    del cfg[serial]
+    save_config(cfg)
+
+    print("Yubikey " + serial + " has been removed")
+
+@sec.command()
+@click.option('-c', '--context', default='', help='Context for the secret to be retrieved.')
+def show(context = bytes()):
+    """
+    Prints secret from associated bundle
+    """
+    serial = get_yubikey_serial()
+    if serial is None:
+        print("Please ensure that yubikey is plugged into USB.")
+        return 0
+    
+    cfg = open_config()
+    if serial not in cfg:
+        print("No registration detected for " + serial + ". Please check yubikey registration.")
+        return 1
+    
+    secret = None
+    envelope_list = cfg[serial]
+    for envelope in envelope_list:
+        if envelope['context'] == context:
+            secret = unwrap_secret(envelope)
+            if secret is None:
+                return 1
+    
+    if secret != None:
+        print("Unlocked Secret: \"%s\"" % (secret))
+    else:
+        print("No secret registered for \"%s\"" % (context))
+
+@sec.command()
+@click.option('-c', '--context', default='', help='Context for the secret to be retrieved.')
+def get(context = bytes()):
+    """
+    Retrieves secret from bundle
+    """
+    serial = get_yubikey_serial()
+    if serial is None:
+        return 1
+    
+    cfg = open_config()
+    if serial not in cfg:
+        return 1
+    
+    envelope_list = cfg[serial]
+    for envelope in envelope_list:
+        if envelope['context'] == context:
+            secret = unwrap_secret(envelope)
+            if secret is None:
+                return 1
+    
+    print("\"%s\"" % (secret))
+
+@sec.command()
+def list():
+    """
+    List serial numbers of yubikey's that are registered
+    """
+    cfg = open_config()
+    for serial in cfg:
+        print(" -- SN: " + serial)
+        envelope_list = cfg[serial]
+        for envelope in envelope_list:
+            print(" ---- CTX: " + envelope['context'])
+
+sec.add_command(enroll)
+sec.add_command(remove)
+sec.add_command(show)
+sec.add_command(get)
+sec.add_command(list)
+
+if __name__ == '__main__':
+    sec()

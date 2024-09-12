@@ -7,6 +7,13 @@ function install_ykbw(){
     sudo chmod 755 /usr/bin/ykbw
 }
 
+function install_yksec(){
+    echo "Installing yksec ..."
+    sudo cp yksec /usr/bin
+    sudo chown root:root /usr/bin/yksec
+    sudo chmod 755 /usr/bin/yksec
+}
+
 function install_yubikey_luks(){
     echo "Installing Yubikey Luks ..."
 
@@ -24,6 +31,7 @@ function install_yubikey_luks(){
 }
 
 install_ykbw
+install_yksec
 install_yubikey_luks
 
 echo "Complete"
