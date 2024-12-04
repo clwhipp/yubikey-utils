@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.exceptions import InvalidTag
 import base64
+import pwd
 
 @click.group()
 def sec():
@@ -57,7 +58,7 @@ def open_config():
     cfg_path = os.getenv('YKSEC_PATH')
     if cfg_path == None:
 
-        username = os.getlogin()
+        username = pwd.getpwuid(os.getuid())[0]
         cfg_dir = "/home/%s/.config/yksec" % (username)
         cfg_path = os.path.join(cfg_dir, 'bundles.json')
         if not os.path.exists(cfg_dir):
@@ -75,7 +76,7 @@ def save_config(cfg):
     cfg_path = os.getenv('YKSEC_PATH')
     if cfg_path == None:
 
-        username = os.getlogin()
+        username = pwd.getpwuid(os.getuid())[0]
         cfg_dir = "/home/%s/.config/yksec" % (username)
         cfg_path = os.path.join(cfg_dir, 'bundles.json')
         if not os.path.exists(cfg_dir):
