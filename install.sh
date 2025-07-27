@@ -30,9 +30,18 @@ function install_yubikey_luks(){
     sudo chmod 755 /usr/bin/yubikey-luks-open
 }
 
+function install_ykluks(){
+    echo "Installing ykluks ..."
+
+    sudo cp ykluks /usr/bin/ykluks
+    sudo chown root:root /usr/bin/ykluks
+    sudo chmod 755 /usr/bin/ykluks
+}
+
 install_ykbw
 install_yksec
 install_yubikey_luks
+install_ykluks
 
 echo "Complete"
 

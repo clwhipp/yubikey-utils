@@ -1,0 +1,99 @@
+#!/bin/bash
+
+function require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "This script must be run as root." >&2
+        exit 1
+    fi
+}
+
+function get_luks_uuid() {
+    local device="$1"
+    cryptsetup luksUUID "$device"
+}
+
+function find_4tb_disks(){
+    lsblk | grep -e "sd[a-z].*3.6T.*disk" | awk '{print "/dev/" $1}'
+}
+
+function generate_disk_password(){
+    local disk="$1"
+    #echo "Generating password for disk: $disk"
+
+    local uid=$(get_luks_uuid "$disk")
+    #echo "LUKS UUID: $uid"
+
+    local uid_hash=$(echo -n "$uid" | sha256sum | awk '{print $1}')
+    #echo "LUKS UUID hash: $uid_hash"
+
+    local yk_response="$(printf %s "$uid_hash" | ykchalresp -2 -i- 2>/dev/null || true)"
+    #echo "Yubikey Response: $yk_response"
+
+    local password=$(printf %s "$yk_response" | sha256sum | awk '{print $1}')
+    echo "$password"
+}
+
+function enroll_disk(){
+    disk="$1"
+    luks_slot="$2"
+
+    # Generate password for the disk based on yubikey
+    local password=$(generate_disk_password "$disk")
+    if [[ -z "$password" ]]; then
+        echo "Failed to generate password for disk $disk"
+        return 1
+    fi
+
+    # retrieve existing passphrase to support enrollment
+    OLD=$(/lib/cryptsetup/askpass "Please provide an existing passphrase. This is NOT the passphrase you just entered, this is the passphrase that you currently use to unlock your LUKS encrypted drive:")
+    if [ "$DBG" = "1" ]; then echo "Old passphrase: $OLD"; fi
+    if [ -z "$OLD" ]; then
+        echo "No existing passphrase provided."
+        return 1
+    fi
+
+    # Add the new key to the LUKS slot
+    printf '%s\n' "$OLD" "$password" "$password" | cryptsetup --key-slot="$luks_slot" luksAddKey "$disk" 2>&1;
+    
+    return 0
+}
+
+function unlock_disk(){
+    disk="$1"
+    secret_name="$2"
+
+    # Unlock the disk using the generated password
+    local password=$(generate_disk_password "$disk")
+    if [[ -z "$password" ]]; then
+        echo "Failed to generate password for disk $disk"
+        return 1
+    fi
+
+    printf %s "${password}" | cryptsetup luksOpen "$disk" "$secret_name" 2>&1;
+    echo "Disk $disk unlocked successfully."
+}
+
+case "$1" in
+    enroll)
+        if [[ -z "$2" || -z "$3" ]]; then
+            echo "Usage: $0 enroll <device> <luks_slot>"
+            exit 1
+        fi
+        require_root
+        enroll_disk "$2" "$3"
+        ;;
+    open)
+        if [[ -z "$2" || -z "$3" ]]; then
+            echo "Usage: $0 open <device> <secret_name>"
+            exit 1
+        fi
+        require_root
+        unlock_disk "$2" "$3"
+        ;;
+    *)
+        echo "Usage:"
+        echo "  $0 enroll <device> <luks_slot>   # Enroll Yubikey-based password to LUKS slot"
+        echo "  $0 open <device> <secret_name>   # Open LUKS device with Yubikey-based password"
+        exit 1
+        ;;
+esac
