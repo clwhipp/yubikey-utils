@@ -332,7 +332,7 @@ def get(context = bytes()):
             if secret is None:
                 return 1
     
-    print("\"%s\"" % (secret))
+    print("%s" % (secret))
 
 @sec.command()
 def list():
